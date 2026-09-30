@@ -195,7 +195,7 @@
  
  #if defined(WITH_ZLIB)
  #include "network/network_content.h"
-@@ -3786,6 +3788,65 @@
+@@ -3786,6 +3788,171 @@
  	}
  
  	ShowTownViewWindow(town_id);
@@ -203,33 +203,104 @@
 +	return true;
 +}
 +
++/** Print a short list of towns, used to show the user what matched. */
++static void PrintTownCandidates(const std::vector<Town *> &towns, size_t max_count)
++{
++	const size_t shown = std::min(towns.size(), max_count);
++	for (size_t i = 0; i < shown; i++) {
++		IConsolePrint(CC_INFO, "    {}  {}  (人口 {})",
++				towns[i]->index.base(), towns[i]->GetCachedName(), towns[i]->cache.population);
++	}
++	if (towns.size() > shown) {
++		IConsolePrint(CC_INFO, "    ...（还有 {} 座没列出）", towns.size() - shown);
++	}
++}
++
++/**
++ * Turn a single command line argument into a town.
++ * The argument is either a plain number (a town ID) or a (partial) town name.
++ * An exact name match wins; a partial name is only accepted when it matches
++ * exactly one town. Otherwise the possible matches are printed, so the user can
++ * either refine the name or use an ID.
++ * @param arg The command line argument to resolve.
++ * @return The town, or nullptr when the argument does not resolve to exactly one town.
++ */
++static Town *ResolveTownArg(std::string_view arg)
++{
++	if (arg.empty()) return nullptr;
++
++	/* All digits: treat it as a town ID. */
++	const bool is_number = std::all_of(arg.begin(), arg.end(), [](char c) { return c >= '0' && c <= '9'; });
++	if (is_number) {
++		const TownID id = ParseType<TownID>(arg).value_or(TownID::Invalid());
++		if (Town::IsValidID(id)) return Town::Get(id);
++		IConsolePrint(CC_ERROR, "没有 ID 为 {} 的城镇。", arg);
++		return nullptr;
++	}
++
++	/* Otherwise look the name up, preferring an exact match. */
++	std::vector<Town *> exact_match;
++	std::vector<Town *> partial_match;
++	for (Town *t : Town::Iterate()) {
++		const std::string_view name = t->GetCachedName();
++		if (StrEqualsIgnoreCase(name, arg)) {
++			exact_match.push_back(t);
++		} else if (StrContainsIgnoreCase(name, arg)) {
++			partial_match.push_back(t);
++		}
++	}
++
++	if (exact_match.size() == 1) return exact_match[0];
++
++	const std::vector<Town *> &candidates = exact_match.empty() ? partial_match : exact_match;
++	if (candidates.empty()) {
++		IConsolePrint(CC_ERROR, "没有名字里包含「{}」的城镇。可以先用 'list_towns {}' 找找。", arg, arg);
++		return nullptr;
++	}
++	if (candidates.size() == 1) return candidates[0];
++
++	IConsolePrint(CC_ERROR, "「{}」匹配到 {} 座城镇，请写得更精确一些，或者直接给城镇 ID：", arg, candidates.size());
++	PrintTownCandidates(candidates, 20);
++	return nullptr;
++}
++
 +static bool ConListTowns(std::span<std::string_view> argv)
 +{
-+	if (argv.size() != 1) {
-+		IConsolePrint(CC_HELP, "Debug: List all towns with their IDs.  Usage: 'list_towns'");
++	if (argv.size() > 2) {
++		IConsolePrint(CC_HELP, "Debug: List towns.  Usage: 'list_towns [name filter]'");
 +		return true;
 +	}
 +
-+	std::vector<const Town *> towns;
-+	for (const Town *t : Town::Iterate()) towns.push_back(t);
++	const std::string_view filter = (argv.size() == 2) ? argv[1] : std::string_view{};
++
++	std::vector<Town *> towns;
++	for (Town *t : Town::Iterate()) {
++		if (!filter.empty() && !StrContainsIgnoreCase(t->GetCachedName(), filter)) continue;
++		towns.push_back(t);
++	}
 +	std::sort(towns.begin(), towns.end(), [](const Town *a, const Town *b) {
-+		return a->cache.population > b->cache.population;
++		return StrCompareIgnoreCase(a->GetCachedName(), b->GetCachedName()) < 0;
 +	});
 +
-+	for (const Town *t : towns) {
-+		IConsolePrint(CC_INFO, "{}: {} (population {}, houses {}, city {})",
-+				t->index.base(), t->GetCachedName(), t->cache.population, t->cache.num_houses, t->larger_town ? "yes" : "no");
++	if (filter.empty()) {
++		IConsolePrint(CC_INFO, "共 {} 座城镇（按名称排序）：", towns.size());
++	} else {
++		IConsolePrint(CC_INFO, "名字里包含「{}」的城镇有 {} 座：", filter, towns.size());
 +	}
 +
++	constexpr size_t MAX_PRINT = 60;
++	PrintTownCandidates(towns, MAX_PRINT);
++	IConsolePrint(CC_HELP, "提示：merge_towns <被并入的城镇> <保留的城镇> —— 名字或 ID 都行，多个源城用逗号隔开。");
 +	return true;
 +}
 +
 +static bool ConMergeTowns(std::span<std::string_view> argv)
 +{
 +	if (argv.size() != 3) {
-+		IConsolePrint(CC_HELP, "Debug: Merge one town into another.  Usage: 'merge_towns <source-town-id> <destination-town-id>'");
-+		IConsolePrint(CC_HELP, "The source town is absorbed by the destination town and is then removed. Use 'list_towns' to find the town IDs.");
-+		IConsolePrint(CC_HELP, "This modifies the savegame in place and is not reversible: make a backup first.");
++		IConsolePrint(CC_HELP, "Debug: Merge one or more towns into another.  Usage: 'merge_towns <source> <destination>'");
++		IConsolePrint(CC_HELP, "  <source> / <destination>: town name or town ID; several sources can be separated by commas");
++		IConsolePrint(CC_HELP, "  A partial name is accepted as long as it matches exactly one town.  Put double quotes around names containing spaces.");
++		IConsolePrint(CC_HELP, "  Examples: merge_towns \"丹霞凹,东桥洞\" 珠三角     merge_towns 12 45");
 +		return true;
 +	}
 +
@@ -238,30 +309,65 @@
 +		return true;
 +	}
 +
-+	TownID source_id = ParseType<TownID>(argv[1]).value_or(TownID::Invalid());
-+	TownID destination_id = ParseType<TownID>(argv[2]).value_or(TownID::Invalid());
-+	if (!Town::IsValidID(source_id) || !Town::IsValidID(destination_id)) {
-+		IConsolePrint(CC_ERROR, "Invalid town ID. Use 'list_towns' to see the available towns.");
-+		return true;
-+	}
-+	if (source_id == destination_id) {
-+		IConsolePrint(CC_ERROR, "The source town and the destination town must be different.");
-+		return true;
++	Town *destination = ResolveTownArg(argv[2]);
++	if (destination == nullptr) return true;
++	const TownID destination_id = destination->index;
++
++	auto trim = [](std::string_view s) {
++		while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
++		while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.remove_suffix(1);
++		return s;
++	};
++
++	size_t merged = 0;
++	size_t failed = 0;
++	const std::string_view list = argv[1];
++	size_t offset = 0;
++	while (offset <= list.size()) {
++		const size_t comma = list.find(',', offset);
++		const size_t length = (comma == std::string_view::npos) ? std::string_view::npos : comma - offset;
++		const std::string_view arg = trim(list.substr(offset, length));
++
++		if (!arg.empty()) {
++			Town *source = ResolveTownArg(arg);
++			if (source == nullptr) {
++				failed++;
++			} else if (source->index == destination_id) {
++				IConsolePrint(CC_WARNING, "「{}」就是目标城镇本身，跳过。", source->GetCachedName());
++			} else {
++				/* Capture everything we need before the merge deletes the source town. */
++				const std::string source_name{source->GetCachedName()};
++				const uint32_t source_population = source->cache.population;
++				const uint16_t source_id = source->index.base();
++
++				if (MergeTowns(source->index, destination_id)) {
++					destination = Town::Get(destination_id);
++					IConsolePrint(CC_WARNING, "已把「{}」(id {}, 人口 {}) 并入「{}」；现在人口 {}。",
++							source_name, source_id, source_population,
++							destination->GetCachedName(), destination->cache.population);
++					merged++;
++				} else {
++					IConsolePrint(CC_ERROR, "合并「{}」(id {}) 失败。", source_name, source_id);
++					failed++;
++				}
++			}
++		}
++
++		if (comma == std::string_view::npos) break;
++		offset = comma + 1;
 +	}
 +
-+	/* Capture the names before merging: the source town is deleted by the merge. */
-+	const std::string source_name{Town::Get(source_id)->GetCachedName()};
-+	const std::string destination_name{Town::Get(destination_id)->GetCachedName()};
-+
-+	if (MergeTowns(source_id, destination_id)) {
-+		IConsolePrint(CC_WARNING, "Merged town '{}' into town '{}'.", source_name, destination_name);
++	if (merged > 0) {
++		IConsolePrint(CC_WARNING, "完成：成功合并 {} 座，失败 {} 座。", merged, failed);
++		IConsolePrint(CC_INFO, "此操作不可撤销 —— 建议立刻「另存为」一个新档，然后重新载入验证。");
++		ShowTownViewWindow(destination_id);
 +	} else {
-+		IConsolePrint(CC_ERROR, "Failed to merge the towns.");
++		IConsolePrint(CC_ERROR, "没有任何城镇被合并（失败 {} 座）。", failed);
 +	}
  
  	return true;
  }
-@@ -4635,6 +4696,8 @@
+@@ -4635,6 +4802,8 @@
  	IConsole::CmdRegister("show_town_window",        ConShowTownWindow,   nullptr, true);
  	IConsole::CmdRegister("show_station_window",     ConShowStationWindow, nullptr, true);
  	IConsole::CmdRegister("show_industry_window",    ConShowIndustryWindow, nullptr, true);
@@ -270,3 +376,182 @@
  	IConsole::CmdRegister("viewport_debug",          ConViewportDebug,    nullptr, true);
  	IConsole::CmdRegister("viewport_mark_dirty",     ConViewportMarkDirty, nullptr, true);
  	IConsole::CmdRegister("viewport_mark_dirty_st_overlay", ConViewportMarkStationOverlayDirty, nullptr, true);
+--- a/src/widgets/town_widget.h
++++ b/src/widgets/town_widget.h
+@@ -48,6 +48,7 @@
+ 	WID_TV_EXPAND_ROADS, ///< Expand roads of this town (scenario editor only).
+ 	WID_TV_DELETE,         ///< Delete this town (scenario editor only).
+ 	WID_TV_GRAPH,
++	WID_TV_MERGE_TOWN,     ///< Merge another town into this one (local debug tool).
+ };
+ 
+ /** Widgets of the #FoundTownWindow class. */
+--- a/src/town.h
++++ b/src/town.h
+@@ -324,6 +324,23 @@
+ void UpdateAllTownVirtCoords();
+ void ClearAllTownCachedNames();
+ void ShowTownViewWindow(TownID town);
++
++/**
++ * Check whether a town is waiting for the player to pick the town it should absorb.
++ * @param source Receives the town that will absorb the clicked town.
++ * @return True when such a pick is pending.
++ */
++bool GetTownMergePickSource(TownID &source);
++
++/**
++ * Merge the town that was clicked into the town that is waiting to absorb one.
++ * @param absorbed_id The town that was clicked.
++ * @return True when a pending pick was handled.
++ */
++bool HandleTownMergePick(TownID absorbed_id);
++
++/** Abandon a pending town merge pick. */
++void ClearTownMergePick();
+ void ExpandTown(Town *t);
+ 
+ void RebuildTownKdtree();
+--- a/src/town_gui.cpp
++++ b/src/town_gui.cpp
+@@ -553,6 +553,61 @@
+ 
+ 
+ /** Town view window. */
++/** The town that is waiting for the player to click the town it should absorb. */
++static TownID _merge_town_pick_source = TownID::Invalid();
++
++/**
++ * Stop waiting for a town to be picked for merging.
++ */
++void ClearTownMergePick()
++{
++	_merge_town_pick_source = TownID::Invalid();
++}
++
++/**
++ * Get the town that is waiting for another town to be merged into it.
++ * A pending merge is abandoned as soon as the town window that started it is gone.
++ * @param source Receives the town that will absorb the clicked town.
++ * @return True when a merge is pending.
++ */
++bool GetTownMergePickSource(TownID &source)
++{
++	if (_merge_town_pick_source == TownID::Invalid() || !Town::IsValidID(_merge_town_pick_source)) {
++		_merge_town_pick_source = TownID::Invalid();
++		return false;
++	}
++	if (FindWindowById(WindowClass::TownView, _merge_town_pick_source) == nullptr) {
++		_merge_town_pick_source = TownID::Invalid();
++		return false;
++	}
++	source = _merge_town_pick_source;
++	return true;
++}
++
++/**
++ * Merge the given town into the town that is waiting to absorb one.
++ * This is called when the player clicks a town while the merge tool is active.
++ * @param absorbed_id The town that was clicked.
++ * @return True when a pending merge was handled.
++ */
++bool HandleTownMergePick(TownID absorbed_id)
++{
++	TownID destination_id;
++	if (!GetTownMergePickSource(destination_id)) return false;
++
++	if (absorbed_id == destination_id || !Town::IsValidID(absorbed_id)) {
++		ShowErrorMessage(GetEncodedString(STR_TOWN_VIEW_MERGE_TOWN_SAME), {}, WarningLevel::Info);
++		return true;
++	}
++
++	ClearTownMergePick();
++	ResetObjectToPlace();
++
++	if (MergeTowns(absorbed_id, destination_id)) {
++		ShowTownViewWindow(destination_id);
++	}
++	return true;
++}
+ struct TownViewWindow : Window {
+ private:
+ 	Town *town = nullptr; ///< Town displayed by the window.
+@@ -730,11 +785,27 @@
+ 				Command<Commands::DeleteTown>::Post(STR_ERROR_TOWN_CAN_T_DELETE, static_cast<TownID>(this->window_number));
+ 				break;
+ 
++			case WID_TV_MERGE_TOWN: // merge another town into this one (local debug tool)
++				if (!_networking && HandlePlacePushButton(this, WID_TV_MERGE_TOWN, SPR_CURSOR_TOWN, HT_NONE)) {
++					_merge_town_pick_source = static_cast<TownID>(this->window_number);
++				} else {
++					ClearTownMergePick();
++				}
++				break;
++
+ 			case WID_TV_GRAPH: {
+ 				ShowTownCargoGraph(this->window_number);
+ 				break;
+ 			}
+ 		}
++	}
++
++	void OnPlaceObjectAbort() override
++	{
++		/* The merge tool was cancelled (Esc, right-click, or another tool was picked). */
++		this->RaiseWidget(WID_TV_MERGE_TOWN);
++		this->SetDirty();
++		ClearTownMergePick();
+ 	}
+ 
+ 	void UpdateWidgetSize(WidgetID widget, Dimension &size, [[maybe_unused]] const Dimension &padding, [[maybe_unused]] Dimension &fill, [[maybe_unused]] Dimension &resize) override
+@@ -861,6 +932,7 @@
+ 		NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_SHOW_AUTHORITY), SetMinimalSize(80, 12), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_LOCAL_AUTHORITY_BUTTON, STR_TOWN_VIEW_LOCAL_AUTHORITY_TOOLTIP),
+ 		NWidget(WWT_TEXTBTN, Colours::Brown, WID_TV_CATCHMENT), SetMinimalSize(40, 12), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_BUTTON_CATCHMENT, STR_TOOLTIP_CATCHMENT),
+ 		NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_GRAPH), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_CARGO_GRAPH, STR_TOWN_VIEW_CARGO_GRAPH_TOOLTIP),
++		NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_MERGE_TOWN), SetMinimalSize(60, 12), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_MERGE_TOWN_BUTTON, STR_TOWN_VIEW_MERGE_TOWN_TOOLTIP),
+ 		NWidget(WWT_RESIZEBOX, Colours::Brown),
+ 	EndContainer(),
+ };
+@@ -895,6 +967,7 @@
+ 		NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_EXPAND_ROADS), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_EXPAND_ROADS_BUTTON, STR_TOWN_VIEW_EXPAND_ROADS_TOOLTIP),
+ 	EndContainer(),
+ 	NWidget(NWID_HORIZONTAL),
++		NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_MERGE_TOWN), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_MERGE_TOWN_BUTTON, STR_TOWN_VIEW_MERGE_TOWN_TOOLTIP),
+ 		NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_DELETE), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_DELETE_BUTTON, STR_TOWN_VIEW_DELETE_TOOLTIP),
+ 		NWidget(WWT_TEXTBTN, Colours::Brown, WID_TV_CATCHMENT), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_BUTTON_CATCHMENT, STR_TOOLTIP_CATCHMENT),
+ 		NWidget(WWT_RESIZEBOX, Colours::Brown),
+--- a/src/viewport.cpp
++++ b/src/viewport.cpp
+@@ -5279,6 +5279,8 @@
+ 		}
+ 	});
+ 
++	/* A pending town merge takes priority over the normal click handling. */
++	if (last_t != nullptr && HandleTownMergePick(last_t->index)) return true;
+ 	/* Select which hit to handle based on priority */
+ 	if (last_st != nullptr) {
+ 		if (Station::IsExpected(last_st)) {
+--- a/src/lang/english.txt
++++ b/src/lang/english.txt
+@@ -3778,6 +3778,9 @@
+ STR_TOWN_VIEW_LOCAL_AUTHORITY_TOOLTIP                           :{BLACK}Show information on local authority
+ STR_TOWN_VIEW_RENAME_TOOLTIP                                    :{BLACK}Change town name
+ STR_TOWN_VIEW_CARGO_GRAPH                                       :Cargo Graph
++STR_TOWN_VIEW_MERGE_TOWN_BUTTON                                 :{BLACK}Merge town
++STR_TOWN_VIEW_MERGE_TOWN_TOOLTIP                                :{BLACK}Merge another town into this one. After clicking this button, click a town on the map to choose the one that will be absorbed by this town. Press <Esc> or right-click to cancel
++STR_TOWN_VIEW_MERGE_TOWN_SAME                                   :{WHITE}That is this town itself; click a different town
+ STR_TOWN_VIEW_CARGO_GRAPH_TOOLTIP                               :Show graph of town's cargo history
+ 
+ STR_TOWN_VIEW_EXPAND_BUTTON                                     :{BLACK}Expand
+--- a/src/lang/simplified_chinese.txt
++++ b/src/lang/simplified_chinese.txt
+@@ -3762,6 +3762,9 @@
+ STR_TOWN_VIEW_LOCAL_AUTHORITY_TOOLTIP                           :{BLACK}显示地方政府的信息
+ STR_TOWN_VIEW_RENAME_TOOLTIP                                    :{BLACK}城镇改名
+ STR_TOWN_VIEW_CARGO_GRAPH                                       :货物图表
++STR_TOWN_VIEW_MERGE_TOWN_BUTTON                                 :{BLACK}合并城市
++STR_TOWN_VIEW_MERGE_TOWN_TOOLTIP                                :{BLACK}把其他城市并入本城。点击本按钮后，在地图上点选要被并入的城市（按 <Esc> 或右键取消）
++STR_TOWN_VIEW_MERGE_TOWN_SAME                                   :{WHITE}这就是本城自己，请点击另一座城市
+ STR_TOWN_VIEW_CARGO_GRAPH_TOOLTIP                               :显示城镇货物历史图表
+ 
+ STR_TOWN_VIEW_EXPAND_BUTTON                                     :{BLACK}扩展
