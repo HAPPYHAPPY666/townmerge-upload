@@ -62,12 +62,32 @@ jobs:
 
           cmake --build . --target openttd
 
-      - name: Collect the executable
+          # The patch edits src/lang/english.txt. The .lng header stores a hash of the
+          # generated strings.h ("LanguagePackHeader::version"), so the language packs
+          # shipped with the official 0.73.1 release no longer match this executable --
+          # the game then aborts with "No available language packs (invalid versions?)".
+          # Build all language files so matching .lng files can be shipped alongside.
+          cmake --build . --target language_files
+
+      - name: Collect the executable and the matching language packs
         shell: bash
         run: |
-          mkdir -p out
+          set -e
+          mkdir -p out/lang
           cp src/build/openttd.exe out/
+
+          if [ -z "$(ls -A src/build/lang 2>/dev/null)" ]; then
+            echo "::error::src/build/lang is empty; language packs were not generated."
+            exit 1
+          fi
+          cp src/build/lang/*.lng out/lang/
+
+          echo "::group::Collected files"
           ls -l out
+          echo "language packs: $(ls out/lang | wc -l)"
+          ls out/lang | head -5
+          ls -l out/lang/english.lng out/lang/simplified_chinese.lng
+          echo "::endgroup::"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
