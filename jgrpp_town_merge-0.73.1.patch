@@ -1,0 +1,272 @@
+--- a/src/town_cmd.h
++++ b/src/town_cmd.h
+@@ -46,4 +46,15 @@
+ DEF_CMD_TUPLE_NT(Commands::TownSettingOverride,           CmdOverrideTownSetting,           CMD_DEITY | CMD_SERVER, CommandType::OtherManagement,       CmdDataT<TownID, TownSettingOverrideFlags, bool, uint8_t>)
+ DEF_CMD_TUPLE_NT(Commands::TownSettingOverrideNonAdmin,   CmdOverrideTownSettingNonAdmin,                       {}, CommandType::OtherManagement,       CmdDataT<TownID, TownSettingOverrideFlags, bool, uint8_t>)
+ 
++/**
++ * Merge one town into another: everything the source town owns (houses, town
++ * roads, stations, waypoints, depots, industries and objects) is transferred to
++ * the destination town, after which the source town is deleted.
++ * @param source_id The town to merge away.
++ * @param destination_id The town that absorbs @p source_id.
++ * @return True on success, false if the given town IDs are not usable.
++ * @note This is a debug/utility function, not a networked command.
++ */
++bool MergeTowns(TownID source_id, TownID destination_id);
++
+ #endif /* TOWN_CMD_H */
+--- a/src/town_cmd.cpp
++++ b/src/town_cmd.cpp
+@@ -49,6 +49,7 @@
+ #include "core/random_func.hpp"
+ #include "core/backup_type.hpp"
+ #include "depot_base.h"
++#include "goal_base.h"
+ #include "object_map.h"
+ #include "object_base.h"
+ #include "ai/ai.hpp"
+@@ -3809,6 +3810,150 @@
+ }
+ 
+ /**
++ * Merge one town into another.
++ *
++ * Everything the source town owns is re-assigned to the destination town:
++ * the town ownership stored on house and road tiles, stations, waypoints,
++ * depots, industries and objects, plus the cached statistics (population,
++ * house counts, company ratings, statues, ...). Afterwards the source town
++ * is deleted.
++ *
++ * Bridges and tunnels do not store an owner of their own - their ownership is
++ * derived from the adjacent road tiles - so re-assigning those tiles is all
++ * that is needed for them as well.
++ *
++ * This is a debug/utility operation and not a networked command. Only use it
++ * in single player, and always keep a backup of the savegame: anything that
++ * cannot be transferred is dropped (subsidies, cargo packets that originate
++ * from the merged town, NewGRF persistent storage of the merged town).
++ *
++ * @param source_id The town to merge away. It is deleted by this function.
++ * @param destination_id The town that absorbs @p source_id.
++ * @return True on success, false if the given town IDs are not usable.
++ */
++bool MergeTowns(TownID source_id, TownID destination_id)
++{
++	if (source_id == destination_id) return false;
++
++	Town *src = Town::GetIfValid(source_id);
++	Town *dst = Town::GetIfValid(destination_id);
++	if (src == nullptr || dst == nullptr) return false;
++
++	/* 1. Re-assign the town ownership that is stored on the map tiles
++	 *    (houses and town-owned roads). Player-owned road tiles only carry a
++	 *    cached nearest town, which is refreshed by Town::PostDestructor(). */
++	for (TileIndex tile(0); tile < Map::Size(); ++tile) {
++		switch (GetTileType(tile)) {
++			case TileType::House:
++				if (GetTownIndex(tile) == src->index) SetTownIndex(tile, dst->index);
++				break;
++
++			case TileType::Road:
++				if (HasTownOwnedRoad(tile) && GetTownIndex(tile) == src->index) SetTownIndex(tile, dst->index);
++				break;
++
++			default:
++				break;
++		}
++	}
++
++	/* 2. Re-assign stations and waypoints. Their default name is resolved from
++	 *    the town at draw time, so only the cached name has to be dropped. */
++	for (Station *st : Station::Iterate()) {
++		if (st->town != src) continue;
++		st->town = dst;
++		st->cached_name.clear();
++		st->UpdateVirtCoord();
++	}
++	for (Waypoint *wp : Waypoint::Iterate()) {
++		if (wp->town != src) continue;
++		wp->town = dst;
++		wp->cached_name.clear();
++		wp->UpdateVirtCoord();
++	}
++
++	/* 3. Re-assign depots. Their default name is generated on the fly. */
++	for (Depot *d : Depot::Iterate()) {
++		if (d->town == src) d->town = dst;
++	}
++
++	/* 4. Re-assign industries and objects (statues, lighthouses, ...). */
++	for (Industry *i : Industry::Iterate()) {
++		if (i->town == src) i->town = dst;
++	}
++	for (Object *o : Object::Iterate()) {
++		if (o->town == src) o->town = dst;
++	}
++
++	/* 5. A Game Script can create a goal whose destination is a town; that
++	 *    destination is stored as a plain town ID, so it has to be re-pointed
++	 *    before the source town is removed. */
++	for (Goal *g : Goal::Iterate()) {
++		if (g->type == GT_TOWN && g->dst == source_id.base()) g->dst = destination_id.base();
++	}
++
++	/* 6. Merge the cached statistics of the source town into the destination. */
++	auto merge_counts = [](auto &dest, const auto &src_counts) {
++		if (dest.size() < src_counts.size()) dest.resize(src_counts.size(), 0);
++		for (size_t i = 0; i < src_counts.size(); i++) dest[i] += src_counts[i];
++	};
++	merge_counts(dst->cache.building_counts.id_count, src->cache.building_counts.id_count);
++	merge_counts(dst->cache.building_counts.class_count, src->cache.building_counts.class_count);
++
++	dst->cache.num_houses += src->cache.num_houses;
++	dst->cache.population += src->cache.population;
++	dst->church_count += src->church_count;
++	dst->stadium_count += src->stadium_count;
++	dst->larger_town |= src->larger_town;
++
++	/* A company keeps the worse of the two ratings, so that merging cannot be
++	 * abused to launder a bad reputation. */
++	for (CompanyID c : src->have_ratings.IterateSetBits()) {
++		if (dst->have_ratings.Test(c)) {
++			dst->ratings[c] = std::min<int16_t>(dst->ratings[c], src->ratings[c]);
++			dst->unwanted[c] = std::max<uint8_t>(dst->unwanted[c], src->unwanted[c]);
++		} else {
++			dst->have_ratings.Set(c);
++			dst->ratings[c] = src->ratings[c];
++			dst->unwanted[c] = src->unwanted[c];
++		}
++	}
++	for (CompanyID c : src->statues.IterateSetBits()) dst->statues.Set(c);
++	if (src->exclusive_counter > dst->exclusive_counter) {
++		dst->exclusivity = src->exclusivity;
++		dst->exclusive_counter = src->exclusive_counter;
++	}
++
++	/* 7. Recalculate the data that is derived from the merged statistics. */
++	UpdateTownRadius(dst);
++	UpdateTownMaxPass(dst);
++	dst->UpdateVirtCoord();
++	dst->UpdateLabel();
++
++	/* 8. The list of nearby stations of a town is only rebuilt from station
++	 *    catchments when a station or a town is (re)built, and the towns it is
++	 *    derived from are looked up through the house tiles. Now that the
++	 *    houses changed owner, the nearby station lists of the destination town
++	 *    are out of date, and the town growth rate (CountActiveStations) would
++	 *    be computed from an incomplete list. Rebuild them. */
++	Station::RecomputeCatchmentForAll();
++
++	/* 9. Drop the source town. Its destructor removes the remaining references
++	 *    (subsidies, cargo packets, NewGRF persistent storage) and, in debug
++	 *    builds, asserts that no tile/industry/object still points at it. */
++	_town_kdtree.Remove(src->index);
++	_town_local_authority_kdtree.Remove(src->index);
++	if (_viewport_sign_kdtree_valid && src->cache.sign.kdtree_valid()) _viewport_sign_kdtree.Remove(ViewportSignKdtreeItem::MakeTown(src->index));
++	delete src;
++
++	SetWindowDirty(WindowClass::TownView, dst->index);
++	MarkWholeScreenDirty();
++	RebuildTownKdtree();
++
++	return true;
++}
++
++/**
+  * Get cost factors for a TownAction
+  * @param action TownAction to get cost factor for.
+  * @returns Cost factor.
+--- a/src/console_cmds.cpp
++++ b/src/console_cmds.cpp
+@@ -55,6 +55,7 @@
+ #include "waypoint_func.h"
+ #include "economy_func.h"
+ #include "town.h"
++#include "town_cmd.h"
+ #include "industry.h"
+ #include "string_func_extra.h"
+ #include "linkgraph/linkgraphjob.h"
+@@ -80,6 +81,7 @@
+ #include "3rdparty/cpp-btree/btree_set.h"
+ 
+ #include <sstream>
++#include <vector>
+ 
+ #if defined(WITH_ZLIB)
+ #include "network/network_content.h"
+@@ -3786,6 +3788,65 @@
+ 	}
+ 
+ 	ShowTownViewWindow(town_id);
++
++	return true;
++}
++
++static bool ConListTowns(std::span<std::string_view> argv)
++{
++	if (argv.size() != 1) {
++		IConsolePrint(CC_HELP, "Debug: List all towns with their IDs.  Usage: 'list_towns'");
++		return true;
++	}
++
++	std::vector<const Town *> towns;
++	for (const Town *t : Town::Iterate()) towns.push_back(t);
++	std::sort(towns.begin(), towns.end(), [](const Town *a, const Town *b) {
++		return a->cache.population > b->cache.population;
++	});
++
++	for (const Town *t : towns) {
++		IConsolePrint(CC_INFO, "{}: {} (population {}, houses {}, city {})",
++				t->index.base(), t->GetCachedName(), t->cache.population, t->cache.num_houses, t->larger_town ? "yes" : "no");
++	}
++
++	return true;
++}
++
++static bool ConMergeTowns(std::span<std::string_view> argv)
++{
++	if (argv.size() != 3) {
++		IConsolePrint(CC_HELP, "Debug: Merge one town into another.  Usage: 'merge_towns <source-town-id> <destination-town-id>'");
++		IConsolePrint(CC_HELP, "The source town is absorbed by the destination town and is then removed. Use 'list_towns' to find the town IDs.");
++		IConsolePrint(CC_HELP, "This modifies the savegame in place and is not reversible: make a backup first.");
++		return true;
++	}
++
++	if (_game_mode != GameMode::Normal && _game_mode != GameMode::Editor) {
++		IConsolePrint(CC_ERROR, "This command is only available in a game or in the scenario editor.");
++		return true;
++	}
++
++	TownID source_id = ParseType<TownID>(argv[1]).value_or(TownID::Invalid());
++	TownID destination_id = ParseType<TownID>(argv[2]).value_or(TownID::Invalid());
++	if (!Town::IsValidID(source_id) || !Town::IsValidID(destination_id)) {
++		IConsolePrint(CC_ERROR, "Invalid town ID. Use 'list_towns' to see the available towns.");
++		return true;
++	}
++	if (source_id == destination_id) {
++		IConsolePrint(CC_ERROR, "The source town and the destination town must be different.");
++		return true;
++	}
++
++	/* Capture the names before merging: the source town is deleted by the merge. */
++	const std::string source_name{Town::Get(source_id)->GetCachedName()};
++	const std::string destination_name{Town::Get(destination_id)->GetCachedName()};
++
++	if (MergeTowns(source_id, destination_id)) {
++		IConsolePrint(CC_WARNING, "Merged town '{}' into town '{}'.", source_name, destination_name);
++	} else {
++		IConsolePrint(CC_ERROR, "Failed to merge the towns.");
++	}
+ 
+ 	return true;
+ }
+@@ -4635,6 +4696,8 @@
+ 	IConsole::CmdRegister("show_town_window",        ConShowTownWindow,   nullptr, true);
+ 	IConsole::CmdRegister("show_station_window",     ConShowStationWindow, nullptr, true);
+ 	IConsole::CmdRegister("show_industry_window",    ConShowIndustryWindow, nullptr, true);
++	IConsole::CmdRegister("list_towns",              ConListTowns,        nullptr, true);
++	IConsole::CmdRegister("merge_towns",             ConMergeTowns,       ConHookNoNetwork, true);
+ 	IConsole::CmdRegister("viewport_debug",          ConViewportDebug,    nullptr, true);
+ 	IConsole::CmdRegister("viewport_mark_dirty",     ConViewportMarkDirty, nullptr, true);
+ 	IConsole::CmdRegister("viewport_mark_dirty_st_overlay", ConViewportMarkStationOverlayDirty, nullptr, true);

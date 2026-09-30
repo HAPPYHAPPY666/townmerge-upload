@@ -1,0 +1,72 @@
+name: Build OpenTTD 0.73.1 + town merge patch (Windows x64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout upstream source at tag jgrpp-0.73.1
+        uses: actions/checkout@v7
+        with:
+          repository: JGRennison/OpenTTD-patches
+          ref: refs/tags/jgrpp-0.73.1
+          path: src
+          fetch-depth: 0
+
+      - name: Checkout this repository (to get the patch file)
+        uses: actions/checkout@v7
+        with:
+          path: patch
+
+      - name: Apply the town merge patch
+        shell: bash
+        working-directory: src
+        run: |
+          git apply -v ../patch/jgrpp_town_merge-0.73.1.patch
+          echo "::group::Files changed by the patch"
+          git diff --stat
+          echo "::endgroup::"
+
+      - name: Setup vcpkg
+        id: vcpkg
+        uses: OpenTTD/actions/setup-vcpkg@v6
+
+      - name: Configure MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure and build
+        shell: bash
+        working-directory: src
+        run: |
+          mkdir build
+          cd build
+
+          cmake .. -GNinja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DOPTION_USE_ASSERTS=ON \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DCMAKE_TOOLCHAIN_FILE="${{ steps.vcpkg.outputs.vcpkg-cmake }}"
+
+          cmake --build . --target openttd
+
+      - name: Collect the executable
+        shell: bash
+        run: |
+          mkdir -p out
+          cp src/build/openttd.exe out/
+          ls -l out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: openttd-0.73.1-townmerge-win64
+          path: out
+          if-no-files-found: error
