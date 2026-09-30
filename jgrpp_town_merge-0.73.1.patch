@@ -26,7 +26,7 @@
  #include "object_map.h"
  #include "object_base.h"
  #include "ai/ai.hpp"
-@@ -3809,6 +3810,150 @@
+@@ -3809,6 +3810,154 @@
  }
  
  /**
@@ -162,7 +162,11 @@
 +	 *    (subsidies, cargo packets, NewGRF persistent storage) and, in debug
 +	 *    builds, asserts that no tile/industry/object still points at it. */
 +	_town_kdtree.Remove(src->index);
-+	_town_local_authority_kdtree.Remove(src->index);
++	/* The local authority zone kdtree only contains the towns whose zone is
++	 * currently being displayed (Town::show_zone). Kdtree::Remove asserts that
++	 * the element is present, so a town that is not in the tree must not be
++	 * removed from it. */
++	if (src->show_zone) _town_local_authority_kdtree.Remove(src->index);
 +	if (_viewport_sign_kdtree_valid && src->cache.sign.kdtree_valid()) _viewport_sign_kdtree.Remove(ViewportSignKdtreeItem::MakeTown(src->index));
 +	delete src;
 +
